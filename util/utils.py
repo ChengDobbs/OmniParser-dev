@@ -17,18 +17,14 @@ import cv2
 import numpy as np
 # %matplotlib inline
 from matplotlib import pyplot as plt
-import easyocr
 from paddleocr import PaddleOCR
-reader = easyocr.Reader(['en'])
 paddle_ocr = PaddleOCR(
-    lang='en',  # other lang also available
-    use_angle_cls=False,
-    use_gpu=False,  # using cuda will conflict with pytorch in the same process
-    show_log=False,
-    max_batch_size=1024,
-    use_dilation=True,  # improves accuracy
-    det_db_score_mode='slow',  # improves accuracy
-    rec_batch_num=1024)
+    lang="en",
+    ocr_version="PP-OCRv5",
+    use_doc_orientation_classify=False, # Use use_doc_orientation_classify to enable/disable document orientation classification model
+    use_doc_unwarping=False, # Use use_doc_unwarping to enable/disable document unwarping module
+    use_textline_orientation=True, # Use use_textline_orientation to enable/disable textline orientation classification model
+)
 import time
 import base64
 
@@ -228,11 +224,14 @@ def remove_overlap(boxes, iou_threshold, ocr_bbox=None):
     return torch.tensor(filtered_boxes)
 
 
-def remove_overlap_new(boxes, iou_threshold, ocr_bbox=None):
+def remove_overlap_new(boxes, iou_threshold, ocr_bbox=None, preserve_text_priority=True, text_overlap_threshold=0.5):
     '''
     ocr_bbox format: [{'type': 'text', 'bbox':[x,y], 'interactivity':False, 'content':str }, ...]
     boxes format: [{'type': 'icon', 'bbox':[x,y], 'interactivity':True, 'content':None }, ...]
-
+    
+    Args:
+        preserve_text_priority: If True, prioritize preserving OCR text boxes over icon boxes
+        text_overlap_threshold: Threshold for determining if text should be preserved (lower = more preservation)
     '''
     assert ocr_bbox is None or isinstance(ocr_bbox, List)
 
@@ -256,16 +255,23 @@ def remove_overlap_new(boxes, iou_threshold, ocr_bbox=None):
             ratio1, ratio2 = 0, 0
         return max(intersection / union, ratio1, ratio2)
 
-    def is_inside(box1, box2):
+    def is_inside(box1, box2, threshold=0.80):
         # return box1[0] >= box2[0] and box1[1] >= box2[1] and box1[2] <= box2[2] and box1[3] <= box2[3]
         intersection = intersection_area(box1, box2)
         ratio1 = intersection / box_area(box1)
-        return ratio1 > 0.80
+        return ratio1 > threshold
 
     # boxes = boxes.tolist()
     filtered_boxes = []
     if ocr_bbox:
         filtered_boxes.extend(ocr_bbox)
+    
+    # Track which OCR boxes should be preserved
+    ocr_boxes_to_preserve = set()
+    if preserve_text_priority and ocr_bbox:
+        for idx, ocr_elem in enumerate(ocr_bbox):
+            ocr_boxes_to_preserve.add(idx)
+    
     # print('ocr_bbox!!!', ocr_bbox)
     for i, box1_elem in enumerate(boxes):
         box1 = box1_elem['bbox']
@@ -278,30 +284,42 @@ def remove_overlap_new(boxes, iou_threshold, ocr_bbox=None):
                 break
         if is_valid_box:
             if ocr_bbox:
-                # keep yolo boxes + prioritize ocr label
+                # keep yolo boxes + handle ocr overlap with improved logic
                 box_added = False
                 ocr_labels = ''
-                for box3_elem in ocr_bbox:
+                ocr_boxes_to_remove = []
+                
+                for idx, box3_elem in enumerate(ocr_bbox):
                     if not box_added:
                         box3 = box3_elem['bbox']
-                        if is_inside(box3, box1): # ocr inside icon
-                            # box_added = True
-                            # delete the box3_elem from ocr_bbox
-                            try:
-                                # gather all ocr labels
-                                ocr_labels += box3_elem['content'] + ' '
-                                filtered_boxes.remove(box3_elem)
-                            except:
+                        overlap_ratio = intersection_area(box1, box3) / box_area(box3) if box_area(box3) > 0 else 0
+                        
+                        if is_inside(box3, box1, threshold=text_overlap_threshold): # ocr inside icon
+                            if preserve_text_priority and overlap_ratio < 0.9:
+                                # If preserving text priority and overlap is not too high, keep both
                                 continue
-                            # break
-                        elif is_inside(box1, box3): # icon inside ocr, don't added this icon box, no need to check other ocr bbox bc no overlap between ocr bbox, icon can only be in one ocr box
+                            else:
+                                # gather all ocr labels and mark for removal
+                                ocr_labels += box3_elem['content'] + ' '
+                                ocr_boxes_to_remove.append(box3_elem)
+                                if idx in ocr_boxes_to_preserve:
+                                    ocr_boxes_to_preserve.remove(idx)
+                        elif is_inside(box1, box3): # icon inside ocr, don't add this icon box
                             box_added = True
                             break
                         else:
                             continue
+                
+                # Remove OCR boxes that were merged into icon
+                for box_to_remove in ocr_boxes_to_remove:
+                    try:
+                        filtered_boxes.remove(box_to_remove)
+                    except:
+                        continue
+                        
                 if not box_added:
                     if ocr_labels:
-                        filtered_boxes.append({'type': 'icon', 'bbox': box1_elem['bbox'], 'interactivity': True, 'content': ocr_labels, 'source':'box_yolo_content_ocr'})
+                        filtered_boxes.append({'type': 'icon', 'bbox': box1_elem['bbox'], 'interactivity': True, 'content': ocr_labels.strip(), 'source':'box_yolo_content_ocr'})
                     else:
                         filtered_boxes.append({'type': 'icon', 'bbox': box1_elem['bbox'], 'interactivity': True, 'content': None, 'source':'box_yolo_content_yolo'})
             else:
@@ -404,12 +422,28 @@ def int_box_area(box, w, h):
     area = (int_box[2] - int_box[0]) * (int_box[3] - int_box[1])
     return area
 
-def get_som_labeled_img(image_source: Union[str, Image.Image], model=None, BOX_TRESHOLD=0.01, output_coord_in_ratio=False, ocr_bbox=None, text_scale=0.4, text_padding=5, draw_bbox_config=None, caption_model_processor=None, ocr_text=[], use_local_semantics=True, iou_threshold=0.9,prompt=None, scale_img=False, imgsz=None, batch_size=128):
+def get_som_labeled_img(image_source: Union[str, Image.Image], model=None, BOX_TRESHOLD=0.01, output_coord_in_ratio=False, ocr_bbox=None, text_scale=0.4, text_padding=5, draw_bbox_config=None, caption_model_processor=None, ocr_text=[], use_local_semantics=True, iou_threshold=0.9,prompt=None, scale_img=False, imgsz=None, batch_size=128, preserve_text_priority=True, text_overlap_threshold=0.5):
     """Process either an image path or Image object
     
     Args:
         image_source: Either a file path (str) or PIL Image object
-        ...
+        model: YOLO model for object detection
+        BOX_TRESHOLD: Confidence threshold for box detection
+        output_coord_in_ratio: Whether to output coordinates in ratio format
+        ocr_bbox: OCR bounding boxes
+        text_scale: Scale for text annotation
+        text_padding: Padding for text annotation
+        draw_bbox_config: Configuration for drawing bounding boxes
+        caption_model_processor: Model processor for generating captions
+        ocr_text: OCR text content
+        use_local_semantics: Whether to use local semantics for icon parsing
+        iou_threshold: IoU threshold for overlap removal
+        prompt: Prompt for caption generation
+        scale_img: Whether to scale image
+        imgsz: Image size for processing
+        batch_size: Batch size for processing
+        preserve_text_priority: If True, prioritize preserving OCR text boxes over icon boxes
+        text_overlap_threshold: Threshold for determining if text should be preserved (lower = more preservation)
     """
     if isinstance(image_source, str):
         image_source = Image.open(image_source)
@@ -433,7 +467,7 @@ def get_som_labeled_img(image_source: Union[str, Image.Image], model=None, BOX_T
 
     ocr_bbox_elem = [{'type': 'text', 'bbox':box, 'interactivity':False, 'content':txt, 'source': 'box_ocr_content_ocr'} for box, txt in zip(ocr_bbox, ocr_text) if int_box_area(box, w, h) > 0] 
     xyxy_elem = [{'type': 'icon', 'bbox':box, 'interactivity':True, 'content':None} for box in xyxy.tolist() if int_box_area(box, w, h) > 0]
-    filtered_boxes = remove_overlap_new(boxes=xyxy_elem, iou_threshold=iou_threshold, ocr_bbox=ocr_bbox_elem)
+    filtered_boxes = remove_overlap_new(boxes=xyxy_elem, iou_threshold=iou_threshold, ocr_bbox=ocr_bbox_elem, preserve_text_priority=preserve_text_priority, text_overlap_threshold=text_overlap_threshold)
     
     # sort the filtered_boxes so that the one with 'content': None is at the end, and get the index of the first 'content': None
     filtered_boxes_elem = sorted(filtered_boxes, key=lambda x: x['content'] is None)
@@ -501,7 +535,7 @@ def get_xywh_yolo(input):
     x, y, w, h = int(x), int(y), int(w), int(h)
     return x, y, w, h
 
-def check_ocr_box(image_source: Union[str, Image.Image], display_img = True, output_bb_format='xywh', goal_filtering=None, easyocr_args=None, use_paddleocr=False):
+def check_ocr_box(image_source: Union[str, Image.Image], display_img = True, output_bb_format='xywh', goal_filtering=None, text_threshold=0.9, use_paddleocr=False):
     if isinstance(image_source, str):
         image_source = Image.open(image_source)
     if image_source.mode == 'RGBA':
@@ -510,19 +544,10 @@ def check_ocr_box(image_source: Union[str, Image.Image], display_img = True, out
     image_np = np.array(image_source)
     w, h = image_source.size
     if use_paddleocr:
-        if easyocr_args is None:
-            text_threshold = 0.5
-        else:
-            text_threshold = easyocr_args['text_threshold']
-        result = paddle_ocr.ocr(image_np, cls=False)[0]
-        coord = [item[0] for item in result if item[1][1] > text_threshold]
-        text = [item[1][0] for item in result if item[1][1] > text_threshold]
-    else:  # EasyOCR
-        if easyocr_args is None:
-            easyocr_args = {}
-        result = reader.readtext(image_np, **easyocr_args)
-        coord = [item[0] for item in result]
-        text = [item[1] for item in result]
+        result = paddle_ocr.predict(image_np, text_det_thresh=0.3, text_det_box_thresh=0.45, text_det_unclip_ratio=1.5)[0]
+        rec_polys, rec_scores, rec_texts = result["rec_polys"], result["rec_scores"], result["rec_texts"]
+        coord = [rec_polys[i].tolist() for i, score in enumerate(rec_scores) if score > text_threshold]
+        text = [rec_texts[i] for i, score in enumerate(rec_scores) if score > text_threshold]
     if display_img:
         opencv_img = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
         bb = []
