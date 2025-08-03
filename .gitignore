@@ -1,7 +1,9 @@
-weights/*
+weights/
 .gradio
 __pycache__/
 *.ipynb
 util/__pycache__/
 wget-log
 imgs/
+test/
+envs/
